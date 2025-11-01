@@ -601,3 +601,371 @@ Example usage for comparison:
       train_loss = best_history.history['loss']
       val_loss = best_history.history['val_loss']
 """)
+
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import (
+    mean_squared_error, mean_absolute_error, r2_score,
+    accuracy_score, precision_recall_fscore_support, 
+    confusion_matrix, classification_report, roc_curve, auc
+)
+from sklearn.preprocessing import label_binarize
+import os
+import json
+from datetime import datetime
+
+class ModelEvaluator:
+    def __init__(self, output_dir='model_evaluation_results'):
+        """Initialize evaluator with output directory"""
+        self.output_dir = output_dir
+        self.timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.results_dir = os.path.join(output_dir, f'evaluation_{self.timestamp}')
+        os.makedirs(self.results_dir, exist_ok=True)
+        
+    def determine_task_type(self, y_true):
+        """Determine if it's regression or classification"""
+        unique_vals = np.unique(y_true)
+        if len(unique_vals) <= 20 and np.all(y_true == y_true.astype(int)):
+            return 'classification'
+        return 'regression'
+    
+    def evaluate_regression(self, y_true, y_pred, model_name):
+        """Evaluate regression model"""
+        metrics = {
+            'MSE': mean_squared_error(y_true, y_pred),
+            'RMSE': np.sqrt(mean_squared_error(y_true, y_pred)),
+            'MAE': mean_absolute_error(y_true, y_pred),
+            'R2': r2_score(y_true, y_pred),
+            'MAPE': np.mean(np.abs((y_true - y_pred) / (y_true + 1e-10))) * 100
+        }
+        
+        # Plot predictions vs actual
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        
+        # Scatter plot
+        axes[0].scatter(y_true, y_pred, alpha=0.5, edgecolors='k', linewidth=0.5)
+        axes[0].plot([y_true.min(), y_true.max()], 
+                     [y_true.min(), y_true.max()], 
+                     'r--', lw=2, label='Perfect Prediction')
+        axes[0].set_xlabel('Actual Values', fontsize=12)
+        axes[0].set_ylabel('Predicted Values', fontsize=12)
+        axes[0].set_title(f'{model_name} - Predictions vs Actual', fontsize=14, fontweight='bold')
+        axes[0].legend()
+        axes[0].grid(True, alpha=0.3)
+        
+        # Residual plot
+        residuals = y_true - y_pred
+        axes[1].scatter(y_pred, residuals, alpha=0.5, edgecolors='k', linewidth=0.5)
+        axes[1].axhline(y=0, color='r', linestyle='--', lw=2)
+        axes[1].set_xlabel('Predicted Values', fontsize=12)
+        axes[1].set_ylabel('Residuals', fontsize=12)
+        axes[1].set_title(f'{model_name} - Residual Plot', fontsize=14, fontweight='bold')
+        axes[1].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.results_dir, f'{model_name}_regression_plots.png'), 
+                   dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        return metrics
+    
+    def evaluate_classification(self, y_true, y_pred, model_name):
+        """Evaluate classification model"""
+        metrics = {
+            'Accuracy': accuracy_score(y_true, y_pred)
+        }
+        
+        # Get precision, recall, f1 for each class
+        precision, recall, f1, support = precision_recall_fscore_support(
+            y_true, y_pred, average=None, zero_division=0
+        )
+        
+        # Weighted averages
+        metrics['Precision (weighted)'] = precision_recall_fscore_support(
+            y_true, y_pred, average='weighted', zero_division=0
+        )[0]
+        metrics['Recall (weighted)'] = precision_recall_fscore_support(
+            y_true, y_pred, average='weighted', zero_division=0
+        )[1]
+        metrics['F1 (weighted)'] = precision_recall_fscore_support(
+            y_true, y_pred, average='weighted', zero_division=0
+        )[2]
+        
+        # Confusion matrix
+        cm = confusion_matrix(y_true, y_pred)
+        
+        # Plot confusion matrix
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                   cbar_kws={'label': 'Count'})
+        plt.title(f'{model_name} - Confusion Matrix', fontsize=14, fontweight='bold')
+        plt.ylabel('True Label', fontsize=12)
+        plt.xlabel('Predicted Label', fontsize=12)
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.results_dir, f'{model_name}_confusion_matrix.png'), 
+                   dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # Classification report
+        report = classification_report(y_true, y_pred, zero_division=0)
+        with open(os.path.join(self.results_dir, f'{model_name}_classification_report.txt'), 'w') as f:
+            f.write(report)
+        
+        return metrics, cm
+    
+    def plot_training_history(self, history, model_name):
+        """Plot training history for Sequential models"""
+        if history is None:
+            return
+        
+        metrics_to_plot = []
+        for key in history.keys():
+            if not key.startswith('val_'):
+                metrics_to_plot.append(key)
+        
+        n_metrics = len(metrics_to_plot)
+        if n_metrics == 0:
+            return
+        
+        fig, axes = plt.subplots(1, n_metrics, figsize=(6*n_metrics, 5))
+        if n_metrics == 1:
+            axes = [axes]
+        
+        for idx, metric in enumerate(metrics_to_plot):
+            axes[idx].plot(history[metric], label=f'Training {metric}', linewidth=2)
+            
+            val_metric = f'val_{metric}'
+            if val_metric in history:
+                axes[idx].plot(history[val_metric], label=f'Validation {metric}', linewidth=2)
+            
+            axes[idx].set_xlabel('Epoch', fontsize=12)
+            axes[idx].set_ylabel(metric.upper(), fontsize=12)
+            axes[idx].set_title(f'{model_name} - {metric.upper()} History', 
+                               fontsize=14, fontweight='bold')
+            axes[idx].legend()
+            axes[idx].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.results_dir, f'{model_name}_training_history.png'), 
+                   dpi=300, bbox_inches='tight')
+        plt.close()
+    
+    def evaluate_model(self, y_true, y_pred, model_name, history=None):
+        """Evaluate a single model"""
+        print(f"\n{'='*60}")
+        print(f"Evaluating: {model_name}")
+        print(f"{'='*60}")
+        
+        task_type = self.determine_task_type(y_true)
+        print(f"Task Type: {task_type.upper()}")
+        
+        results = {
+            'model_name': model_name,
+            'task_type': task_type
+        }
+        
+        if task_type == 'regression':
+            metrics = self.evaluate_regression(y_true, y_pred, model_name)
+            results['metrics'] = metrics
+            
+            print("\nRegression Metrics:")
+            for metric, value in metrics.items():
+                print(f"  {metric}: {value:.6f}")
+        
+        else:  # classification
+            metrics, cm = self.evaluate_classification(y_true, y_pred, model_name)
+            results['metrics'] = metrics
+            results['confusion_matrix'] = cm.tolist()
+            
+            print("\nClassification Metrics:")
+            for metric, value in metrics.items():
+                print(f"  {metric}: {value:.6f}")
+        
+        # Plot training history if available
+        if history is not None:
+            print("\nTraining history detected - generating plots...")
+            self.plot_training_history(history, model_name)
+            results['has_training_history'] = True
+        else:
+            results['has_training_history'] = False
+        
+        return results
+    
+    def compare_models(self, all_results):
+        """Create comparison visualizations"""
+        if not all_results:
+            return
+        
+        task_type = all_results[0]['task_type']
+        model_names = [r['model_name'] for r in all_results]
+        
+        # Get common metrics
+        if task_type == 'regression':
+            metrics_to_compare = ['RMSE', 'MAE', 'R2', 'MAPE']
+        else:
+            metrics_to_compare = ['Accuracy', 'Precision (weighted)', 
+                                 'Recall (weighted)', 'F1 (weighted)']
+        
+        # Filter metrics that exist in all results
+        available_metrics = set(all_results[0]['metrics'].keys())
+        for result in all_results[1:]:
+            available_metrics &= set(result['metrics'].keys())
+        
+        metrics_to_compare = [m for m in metrics_to_compare if m in available_metrics]
+        
+        if not metrics_to_compare:
+            return
+        
+        # Create comparison plot
+        n_metrics = len(metrics_to_compare)
+        fig, axes = plt.subplots(1, n_metrics, figsize=(6*n_metrics, 5))
+        if n_metrics == 1:
+            axes = [axes]
+        
+        colors = ['#1f77b4', '#ff7f0e', '#2ca02c']
+        
+        for idx, metric in enumerate(metrics_to_compare):
+            values = [r['metrics'][metric] for r in all_results]
+            bars = axes[idx].bar(range(len(model_names)), values, color=colors[:len(model_names)])
+            
+            # Add value labels on bars
+            for bar in bars:
+                height = bar.get_height()
+                axes[idx].text(bar.get_x() + bar.get_width()/2., height,
+                             f'{height:.4f}',
+                             ha='center', va='bottom', fontsize=10)
+            
+            axes[idx].set_xticks(range(len(model_names)))
+            axes[idx].set_xticklabels(model_names, rotation=45, ha='right')
+            axes[idx].set_ylabel(metric, fontsize=12)
+            axes[idx].set_title(f'{metric} Comparison', fontsize=14, fontweight='bold')
+            axes[idx].grid(True, alpha=0.3, axis='y')
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.results_dir, 'model_comparison.png'), 
+                   dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"\n{'='*60}")
+        print("Model Comparison Summary")
+        print(f"{'='*60}")
+        
+        # Find best model for each metric
+        for metric in metrics_to_compare:
+            values = [r['metrics'][metric] for r in all_results]
+            
+            # For R2 and Accuracy, higher is better
+            if metric in ['R2', 'Accuracy', 'Precision (weighted)', 
+                         'Recall (weighted)', 'F1 (weighted)']:
+                best_idx = np.argmax(values)
+            else:  # For error metrics, lower is better
+                best_idx = np.argmin(values)
+            
+            print(f"\nBest {metric}: {model_names[best_idx]} ({values[best_idx]:.6f})")
+    
+    def save_results(self, all_results):
+        """Save all results to JSON"""
+        # Convert numpy types to Python types for JSON serialization
+        def convert_to_json_serializable(obj):
+            if isinstance(obj, np.integer):
+                return int(obj)
+            elif isinstance(obj, np.floating):
+                return float(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            return obj
+        
+        json_results = []
+        for result in all_results:
+            json_result = {
+                'model_name': result['model_name'],
+                'task_type': result['task_type'],
+                'has_training_history': result['has_training_history'],
+                'metrics': {k: convert_to_json_serializable(v) 
+                           for k, v in result['metrics'].items()}
+            }
+            if 'confusion_matrix' in result:
+                json_result['confusion_matrix'] = result['confusion_matrix']
+            json_results.append(json_result)
+        
+        with open(os.path.join(self.results_dir, 'evaluation_results.json'), 'w') as f:
+            json.dump(json_results, f, indent=2)
+        
+        print(f"\n{'='*60}")
+        print(f"Results saved to: {self.results_dir}")
+        print(f"{'='*60}\n")
+
+
+# Main evaluation function
+def evaluate_top_models(y_test, best_y_pred, second_best_y_pred, third_best_y_pred,
+                       best_history=None, second_best_history=None, third_best_history=None,
+                       output_dir='model_evaluation_results'):
+    """
+    Evaluate top 3 models with their predictions and training histories
+    
+    Parameters:
+    -----------
+    y_test : array-like
+        True test labels/values
+    best_y_pred : array-like
+        Predictions from best model
+    second_best_y_pred : array-like
+        Predictions from second best model
+    third_best_y_pred : array-like
+        Predictions from third best model
+    best_history : dict, optional
+        Training history from best model (if Sequential)
+    second_best_history : dict, optional
+        Training history from second best model (if Sequential)
+    third_best_history : dict, optional
+        Training history from third best model (if Sequential)
+    output_dir : str, optional
+        Directory to save results
+    """
+    
+    evaluator = ModelEvaluator(output_dir=output_dir)
+    
+    # Evaluate each model
+    all_results = []
+    
+    models_data = [
+        ('Best Model', best_y_pred, best_history),
+        ('Second Best Model', second_best_y_pred, second_best_history),
+        ('Third Best Model', third_best_y_pred, third_best_history)
+    ]
+    
+    for model_name, y_pred, history in models_data:
+        result = evaluator.evaluate_model(y_test, y_pred, model_name, history)
+        all_results.append(result)
+    
+    # Compare models
+    evaluator.compare_models(all_results)
+    
+    # Save results
+    evaluator.save_results(all_results)
+    
+    return all_results
+
+
+# Usage example:
+"""
+# Get training histories if models are Sequential
+best_history = best_model.history_ if hasattr(best_model, 'history_') else None
+second_best_history = second_best_model.history_ if hasattr(second_best_model, 'history_') else None
+third_best_history = third_best_model.history_ if hasattr(third_best_model, 'history_') else None
+
+# Run evaluation
+results = evaluate_top_models(
+    y_test=y_test,
+    best_y_pred=best_y_pred,
+    second_best_y_pred=second_best_y_pred,
+    third_best_y_pred=third_best_y_pred,
+    best_history=best_history,
+    second_best_history=second_best_history,
+    third_best_history=third_best_history,
+    output_dir='model_evaluation_results'
+)
+"""
