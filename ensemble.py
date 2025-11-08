@@ -1,5 +1,6 @@
 #take best hyperparameters for models. Make the best ensemble. Evaluate at the same time for choosing.
 #choose how the models can be evaluated to be the "best"
+# ensemble methods used: hard voting, stacking)
 
 
 """
@@ -17,7 +18,7 @@ from sklearn.neighbors import KNeighborsClassifier
 from sklearn.svm import SVC
 from sklearn.ensemble import RandomForestClassifier, VotingClassifier, StackingClassifier
 from sklearn.naive_bayes import GaussianNB
-from sklearn.linear_model import RidgeClassifier, LogisticRegression
+from sklearn.linear_model import SGDClassifier, LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.base import BaseEstimator, ClassifierMixin
@@ -30,25 +31,85 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # Load dataset
-X, y = load_wine(return_X_y=True)
+x, y = load_wine(return_x_y=True)
 
-# Split data for final evaluation
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+# Split
+x_train, x_test, y_train, y_test = train_test_split(x, y, test_size=0.2, random_state=42, stratify=y)
 
-# Define CV strategy (on training data)
 cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
 # Suppress optuna logging for cleaner output
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-# Set random seeds for reproducibility
+# Set seeds
 np.random.seed(42)
 tf.random.set_seed(42)
 
+# Creating batch gradient descent classifier using SGDClassifier
+class BatchGradientDescentClassifier(BaseEstimator, ClassifierMixin):
+    """Batch Gradient Descent with configurable batch size for large datasets"""
+    
+    def __init__(self, alpha=0.0001, loss='log_loss', penalty='l2', 
+                 learning_rate='constant', max_iter=100, batch_size=10000, random_state=42):
+        self.alpha = alpha
+        self.loss = loss
+        self.penalty = penalty
+        self.learning_rate = learning_rate
+        self.max_iter = max_iter
+        self.batch_size = batch_size
+        self.random_state = random_state
+        self.model = None
+        self.classes_ = None
+        
+    def fit(self, x, y):
+        np.random.seed(self.random_state)
+        self.classes_ = np.unique(y)
+        
+        # Initialize SGD model with warm_start for iterative training
+        self.model = SGDClassifier(
+            alpha=self.alpha,
+            loss=self.loss,
+            penalty=self.penalty,
+            learning_rate=self.learning_rate,
+            eta0=0.01,  # initial learning rate for constant schedule
+            max_iter=1,
+            warm_start=True,
+            random_state=self.random_state
+        )
+        
+        # Batch Gradient Descent: process in batches of batch_size
+        for epoch in range(self.max_iter):
+            # Shuffle data at the beginning of each epoch
+            indices = np.random.permutation(len(x))
+            x_shuffled = x[indices]
+            y_shuffled = y[indices]
+            
+            # Process in mini-batches
+            for i in range(0, len(x_shuffled), self.batch_size):
+                batch_x = x_shuffled[i:i+self.batch_size]
+                batch_y = y_shuffled[i:i+self.batch_size]
+                self.model.partial_fit(batch_x, batch_y, classes=self.classes_)
+        
+        return self
+    
+    def predict(self, x):
+        x = self.scaler.transform(x)
+        return self.model.predict(x)
+    
+    def predict_proba(self, x):
+        x = self.scaler.transform(x)
+        if hasattr(self.model, 'predict_proba'):
+            return self.model.predict_proba(x)
+        else:
+            # For losses that don't support predict_proba
+            return self.model.decision_function(x)
+    
+    def score(self, x, y):
+        return (self.predict(x) == y).mean()
+    
 
-# ---------- Keras Wrapper for sklearn compatibility ----------
 class KerasClassifierWrapper(BaseEstimator, ClassifierMixin):
-    """Wrapper to make Keras models compatible with sklearn"""
+    """Using scikit-learn wrapper to integrate Keras models to scikit-learn"""
     
     def __init__(self, build_fn, epochs=100, batch_size=32, verbose=0):
         self.build_fn = build_fn
@@ -56,19 +117,12 @@ class KerasClassifierWrapper(BaseEstimator, ClassifierMixin):
         self.batch_size = batch_size
         self.verbose = verbose
         self.model = None
-        self.scaler = StandardScaler()
         self.history_ = None
         self.classes_ = None
         
-    def fit(self, X, y):
+    def fit(self, x, y):
         self.classes_ = np.unique(y)
         n_classes = len(self.classes_)
-        
-        # Scale features
-        X_scaled = self.scaler.fit_transform(X)
-        
-        # Convert labels to categorical
-        y_cat = keras.utils.to_categorical(y, n_classes)
         
         # Build model
         self.model = self.build_fn()
@@ -78,7 +132,6 @@ class KerasClassifierWrapper(BaseEstimator, ClassifierMixin):
         
         # Train
         history = self.model.fit(
-            X_scaled, y_cat,
             epochs=self.epochs,
             batch_size=self.batch_size,
             verbose=self.verbose,
@@ -89,17 +142,18 @@ class KerasClassifierWrapper(BaseEstimator, ClassifierMixin):
         
         return self
     
-    def predict(self, X):
-        X_scaled = self.scaler.transform(X)
-        predictions = self.model.predict(X_scaled, verbose=0)
+    def predict(self, x):
+        predictions = self.model.predict(x, verbose=0)
         return np.argmax(predictions, axis=1)
     
-    def predict_proba(self, X):
-        X_scaled = self.scaler.transform(X)
-        return self.model.predict(X_scaled, verbose=0)
+    def predict_proba(self, x):
+        return self.model.predict(x, verbose=0)
+    
 
 
-# ---------- 1️⃣ Decision Tree ----------
+# Creating models and determining hyperparameter values
+
+#  1- Decision Tree 
 def objective_decision_tree(trial):
     criterion = trial.suggest_categorical("criterion", ["gini", "entropy", "log_loss"])
     max_depth = trial.suggest_int("max_depth", 2, 20)
@@ -114,11 +168,11 @@ def objective_decision_tree(trial):
         random_state=42
     )
     
-    score = cross_val_score(model, X_train, y_train, cv=cv, scoring="accuracy").mean()
+    score = cross_val_score(model, x_train, y_train, cv=cv, scoring="accuracy").mean()
     return score
 
 
-# ---------- 2️⃣ K-Nearest Neighbors ----------
+#  2- K-Nearest Neighbors 
 def objective_knn(trial):
     n_neighbors = trial.suggest_int("n_neighbors", 1, 20)
     weights = trial.suggest_categorical("weights", ["uniform", "distance"])
@@ -129,11 +183,11 @@ def objective_knn(trial):
         ("knn", KNeighborsClassifier(n_neighbors=n_neighbors, weights=weights, p=p))
     ])
     
-    score = cross_val_score(model, X_train, y_train, cv=cv, scoring="accuracy").mean()
+    score = cross_val_score(model, x_train, y_train, cv=cv, scoring="accuracy").mean()
     return score
 
 
-# ---------- 3️⃣ Support Vector Classifier ----------
+#  3- Support Vector Classifier 
 def objective_svc(trial):
     C = trial.suggest_float("C", 1e-3, 1e3, log=True)
     kernel = trial.suggest_categorical("kernel", ["linear", "poly", "rbf", "sigmoid"])
@@ -144,11 +198,11 @@ def objective_svc(trial):
         ("svc", SVC(C=C, kernel=kernel, gamma=gamma, random_state=42))
     ])
     
-    score = cross_val_score(model, X_train, y_train, cv=cv, scoring="accuracy").mean()
+    score = cross_val_score(model, x_train, y_train, cv=cv, scoring="accuracy").mean()
     return score
 
 
-# ---------- 4️⃣ Random Forest ----------
+#  4- Random Forest 
 def objective_rf(trial):
     n_estimators = trial.suggest_int("n_estimators", 50, 300)
     max_depth = trial.suggest_int("max_depth", 2, 20)
@@ -165,11 +219,11 @@ def objective_rf(trial):
         random_state=42
     )
     
-    score = cross_val_score(model, X_train, y_train, cv=cv, scoring="accuracy").mean()
+    score = cross_val_score(model, x_train, y_train, cv=cv, scoring="accuracy").mean()
     return score
 
 
-# ---------- 5️⃣ Naive Bayes ----------
+#  5- Naive Bayes 
 def objective_nb(trial):
     var_smoothing = trial.suggest_float("var_smoothing", 1e-10, 1e-5, log=True)
     
@@ -178,24 +232,32 @@ def objective_nb(trial):
         ("nb", GaussianNB(var_smoothing=var_smoothing))
     ])
     
-    score = cross_val_score(model, X_train, y_train, cv=cv, scoring="accuracy").mean()
+    score = cross_val_score(model, x_train, y_train, cv=cv, scoring="accuracy").mean()
     return score
 
 
-# ---------- 6️⃣ Ridge Classifier ----------
-def objective_ridge(trial):
-    alpha = trial.suggest_float("alpha", 1e-3, 1e3, log=True)
+#  6- Batch Gradient Descent Classifier
+def objective_bgd(trial):
+    alpha = trial.suggest_float("alpha", 1e-5, 1e-1, log=True)
+    loss = trial.suggest_categorical("loss", ["hinge", "log_loss", "modified_huber", "perceptron"])
+    penalty = trial.suggest_categorical("penalty", ["l2", "l1", "elasticnet"])
+    learning_rate = trial.suggest_categorical("learning_rate", ["constant", "optimal", "adaptive"])
+    max_iter = trial.suggest_int("max_iter", 50, 300)
     
-    model = Pipeline([
-        ("scaler", StandardScaler()),
-        ("ridge", RidgeClassifier(alpha=alpha, random_state=42))
-    ])
+    model = BatchGradientDescentClassifier(
+        alpha=alpha,
+        loss=loss,
+        penalty=penalty,
+        learning_rate=learning_rate,
+        max_iter=max_iter,
+        random_state=42
+    )
     
-    score = cross_val_score(model, X_train, y_train, cv=cv, scoring="accuracy").mean()
+    score = cross_val_score(model, x_train, y_train, cv=cv, scoring="accuracy").mean()
     return score
 
 
-# ---------- 7️⃣ Logistic Regression ----------
+#  7- Logistic Regression 
 def objective_lr(trial):
     C = trial.suggest_float("C", 1e-3, 1e3, log=True)
     solver = trial.suggest_categorical("solver", ["lbfgs", "saga"])
@@ -205,11 +267,11 @@ def objective_lr(trial):
         ("lr", LogisticRegression(C=C, solver=solver, max_iter=1000, random_state=42))
     ])
     
-    score = cross_val_score(model, X_train, y_train, cv=cv, scoring="accuracy").mean()
+    score = cross_val_score(model, x_train, y_train, cv=cv, scoring="accuracy").mean()
     return score
 
 
-# ---------- 8️⃣ Deep Learning (TensorFlow/Keras Sequential) ----------
+#  8- Deep Learning (Keras's Sequential) 
 def objective_dl(trial):
     # Architecture parameters
     n_layers = trial.suggest_int("n_layers", 1, 3)
@@ -247,7 +309,7 @@ def objective_dl(trial):
         )
         return model
     
-    # Create wrapper
+    # Use the wrapper
     keras_clf = KerasClassifierWrapper(
         build_fn=build_model,
         epochs=100,
@@ -256,53 +318,53 @@ def objective_dl(trial):
     )
     
     # Evaluate with cross-validation
-    score = cross_val_score(keras_clf, X_train, y_train, cv=cv, scoring="accuracy").mean()
+    score = cross_val_score(keras_clf, x_train, y_train, cv=cv, scoring="accuracy").mean()
     return score
 
 
-# ---------- Run hyperparameter tuning ----------
+#  Run hyperparameter tuning 
 print("=" * 60)
-print("HYPERPARAMETER TUNING")
+print("Testing Hyperparameters")
 print("=" * 60)
 
 studies = {}
 
-print("\n🌳 Tuning Decision Tree...")
+
 studies['dt'] = optuna.create_study(direction="maximize")
 studies['dt'].optimize(objective_decision_tree, n_trials=30, show_progress_bar=True)
 print(f"Best accuracy: {studies['dt'].best_value:.4f}")
 
-print("\n👥 Tuning KNN...")
+
 studies['knn'] = optuna.create_study(direction="maximize")
 studies['knn'].optimize(objective_knn, n_trials=30, show_progress_bar=True)
 print(f"Best accuracy: {studies['knn'].best_value:.4f}")
 
-print("\n🎯 Tuning SVC...")
+
 studies['svc'] = optuna.create_study(direction="maximize")
 studies['svc'].optimize(objective_svc, n_trials=30, show_progress_bar=True)
 print(f"Best accuracy: {studies['svc'].best_value:.4f}")
 
-print("\n🌲 Tuning Random Forest...")
+
 studies['rf'] = optuna.create_study(direction="maximize")
 studies['rf'].optimize(objective_rf, n_trials=30, show_progress_bar=True)
 print(f"Best accuracy: {studies['rf'].best_value:.4f}")
 
-print("\n📊 Tuning Naive Bayes...")
+
 studies['nb'] = optuna.create_study(direction="maximize")
 studies['nb'].optimize(objective_nb, n_trials=20, show_progress_bar=True)
 print(f"Best accuracy: {studies['nb'].best_value:.4f}")
 
-print("\n📏 Tuning Ridge Classifier...")
-studies['ridge'] = optuna.create_study(direction="maximize")
-studies['ridge'].optimize(objective_ridge, n_trials=20, show_progress_bar=True)
-print(f"Best accuracy: {studies['ridge'].best_value:.4f}")
 
-print("\n📈 Tuning Logistic Regression...")
+studies['bgd'] = optuna.create_study(direction="maximize")
+studies['bgd'].optimize(objective_bgd, n_trials=30, show_progress_bar=True)
+print(f"Best accuracy: {studies['bgd'].best_value:.4f}")
+
+
 studies['lr'] = optuna.create_study(direction="maximize")
 studies['lr'].optimize(objective_lr, n_trials=20, show_progress_bar=True)
 print(f"Best accuracy: {studies['lr'].best_value:.4f}")
 
-print("\n🧠 Tuning Deep Learning Models (TensorFlow/Keras)...")
+
 studies['dl'] = optuna.create_study(direction="maximize")
 studies['dl'].optimize(objective_dl, n_trials=50, show_progress_bar=True)
 print(f"Best accuracy: {studies['dl'].best_value:.4f}")
@@ -314,7 +376,7 @@ best_dl_params_2 = all_trials[1].params
 print(f"Second best accuracy: {all_trials[1].value:.4f}")
 
 
-# ---------- Build best models ----------
+#  Structures of best models (except Sequential models)
 best_dt = DecisionTreeClassifier(**studies['dt'].best_params, random_state=42)
 
 best_knn = Pipeline([
@@ -334,17 +396,14 @@ best_nb = Pipeline([
     ("nb", GaussianNB(**studies['nb'].best_params))
 ])
 
-best_ridge = Pipeline([
-    ("scaler", StandardScaler()),
-    ("ridge", RidgeClassifier(**studies['ridge'].best_params, random_state=42))
-])
+best_bgd = BatchGradientDescentClassifier(**studies['bgd'].best_params, random_state=42)
 
 best_lr = Pipeline([
     ("scaler", StandardScaler()),
     ("lr", LogisticRegression(**studies['lr'].best_params, max_iter=1000, random_state=42))
 ])
 
-# Build DL models from best parameters
+# Structures of best Sequential models.
 def build_dl_model_1():
     params = best_dl_params_1
     model = Sequential()
@@ -410,7 +469,7 @@ best_dl2 = KerasClassifierWrapper(
 )
 
 
-# ---------- Hard Voting Ensemble (with 2 best DL models) ----------
+#  Hard Voting Ensemble
 print("\n" + "=" * 60)
 print("ENSEMBLE METHODS")
 print("=" * 60)
@@ -422,7 +481,7 @@ voting_clf = VotingClassifier(
         ('svc', best_svc),
         ('rf', best_rf),
         ('nb', best_nb),
-        ('ridge', best_ridge),
+        ('bgd', best_bgd),
         ('lr', best_lr),
         ('dl1', best_dl1),
         ('dl2', best_dl2)
@@ -430,12 +489,12 @@ voting_clf = VotingClassifier(
     voting='hard'
 )
 
-print("\n🗳️  Evaluating Hard Voting Classifier...")
-voting_score = cross_val_score(voting_clf, X_train, y_train, cv=cv, scoring="accuracy").mean()
+print("\n Evaluating Hard Voting Classifier...")
+voting_score = cross_val_score(voting_clf, x_train, y_train, cv=cv, scoring="accuracy").mean()
 print(f"Hard Voting Accuracy: {voting_score:.4f}")
 
 
-# ---------- Stacking Ensemble ----------
+#  Stacking Ensemble 
 stacking_clf = StackingClassifier(
     estimators=[
         ('dt', best_dt),
@@ -443,7 +502,7 @@ stacking_clf = StackingClassifier(
         ('svc', best_svc),
         ('rf', best_rf),
         ('nb', best_nb),
-        ('ridge', best_ridge),
+        ('bgd', best_bgd),
         ('dl1', best_dl1),
         ('dl2', best_dl2)
     ],
@@ -451,14 +510,16 @@ stacking_clf = StackingClassifier(
     cv=5
 )
 
-print("\n📚 Evaluating Stacking Classifier...")
-stacking_score = cross_val_score(stacking_clf, X_train, y_train, cv=cv, scoring="accuracy").mean()
+print("\n Evaluating Stacking Classifier...")
+stacking_score = cross_val_score(stacking_clf, x_train, y_train, cv=cv, scoring="accuracy").mean()
 print(f"Stacking Accuracy: {stacking_score:.4f}")
 
 
-# ---------- Train all models and get test predictions ----------
+
+
+
 print("\n" + "=" * 60)
-print("TRAINING MODELS ON FULL TRAINING SET")
+print("Training all the best models.")
 print("=" * 60)
 
 models_dict = {
@@ -467,7 +528,7 @@ models_dict = {
     "Support Vector Classifier": best_svc,
     "Random Forest": best_rf,
     "Naive Bayes": best_nb,
-    "Ridge Classifier": best_ridge,
+    "BGD Classifier": best_bgd,
     "Logistic Regression": best_lr,
     "Deep Learning (DL-1)": best_dl1,
     "Deep Learning (DL-2)": best_dl2,
@@ -481,7 +542,7 @@ cv_scores = {
     "Support Vector Classifier": studies['svc'].best_value,
     "Random Forest": studies['rf'].best_value,
     "Naive Bayes": studies['nb'].best_value,
-    "Ridge Classifier": studies['ridge'].best_value,
+    "BGD Classifier": studies['bgd'].best_value,
     "Logistic Regression": studies['lr'].best_value,
     "Deep Learning (DL-1)": all_trials[0].value,
     "Deep Learning (DL-2)": all_trials[1].value,
@@ -492,18 +553,18 @@ cv_scores = {
 # Dictionary to store predictions
 predictions_dict = {}
 
-print("\nTraining and predicting...")
+
 for name, model in models_dict.items():
-    model.fit(X_train, y_train)
-    y_pred = model.predict(X_test)
+    model.fit(x_train, y_train)
+    y_pred = model.predict(x_test)
     predictions_dict[name] = y_pred
     test_acc = (y_pred == y_test).mean()
-    print(f"✓ {name}: Test Accuracy = {test_acc:.4f}")
+    print(f" {name}: Test Accuracy = {test_acc:.4f}")
 
 
-# ---------- Final Comparison ----------
+#  Final Comparison 
 print("\n" + "=" * 60)
-print("📊 FINAL RESULTS SUMMARY")
+print("Final test results:")
 print("=" * 60)
 
 results = [(name, score) for name, score in cv_scores.items()]
@@ -511,10 +572,10 @@ results.sort(key=lambda x: x[1], reverse=True)
 
 print("\nRanked by Cross-Validation Accuracy:")
 for i, (name, acc) in enumerate(results, 1):
-    marker = "🏆" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "  "
+    marker = "1" if i == 1 else "2" if i == 2 else "3" if i == 3 else "  "
     print(f"{marker} {i}. {name:.<40} {acc:.4f}")
 
-# ---------- Save best model predictions and histories ----------
+#  Save best model predictions and histories 
 best_model_name = results[0][0]
 second_best_model_name = results[1][0]
 third_best_model_name = results[2][0]
@@ -534,26 +595,24 @@ second_best_history = second_best_model.history_ if hasattr(second_best_model, '
 third_best_history = third_best_model.history_ if hasattr(third_best_model, 'history_') else None
 
 print("\n" + "=" * 60)
-print(f"🏆 #1 Best Model: {best_model_name}")
+print(f"  #1 Best Model: {best_model_name}")
 print(f"   CV Accuracy: {results[0][1]:.4f}")
 print(f"   Test Accuracy: {(best_y_pred == y_test).mean():.4f}")
 print(f"   Training History: {'Available' if best_history is not None else 'N/A (not a DL model)'}")
 
-print(f"\n🥈 #2 Best Model: {second_best_model_name}")
+print(f"\n  #2 Best Model: {second_best_model_name}")
 print(f"   CV Accuracy: {results[1][1]:.4f}")
 print(f"   Test Accuracy: {(second_best_y_pred == y_test).mean():.4f}")
 print(f"   Training History: {'Available' if second_best_history is not None else 'N/A (not a DL model)'}")
 
-print(f"\n🥉 #3 Best Model: {third_best_model_name}")
+print(f"\n  #3 Best Model: {third_best_model_name}")
 print(f"   CV Accuracy: {results[2][1]:.4f}")
 print(f"   Test Accuracy: {(third_best_y_pred == y_test).mean():.4f}")
 print(f"   Training History: {'Available' if third_best_history is not None else 'N/A (not a DL model)'}")
 print("=" * 60)
 
-print("\n" + "=" * 60)
-print("SAVED VARIABLES FOR FURTHER EVALUATION")
-print("=" * 60)
-print("""
+
+"""
 Available variables for TOP 3 MODELS:
   • y_test                - True labels for test set
   
@@ -576,7 +635,7 @@ Available variables for TOP 3 MODELS:
 All models available:
   • predictions_dict      - All predictions: predictions_dict['Model Name']
   • models_dict           - All trained models: models_dict['Model Name']
-  • X_train, X_test       - Feature sets
+  • x_train, x_test       - Feature sets
   • y_train, y_test       - Label sets
 
 Example usage for comparison:
@@ -600,7 +659,10 @@ Example usage for comparison:
   if best_history is not None:
       train_loss = best_history.history['loss']
       val_loss = best_history.history['val_loss']
-""")
+"""
+
+
+
 
 
 
@@ -907,7 +969,7 @@ def evaluate_top_models(y_test, best_y_pred, second_best_y_pred, third_best_y_pr
     Evaluate top 3 models with their predictions and training histories
     
     Parameters:
-    -----------
+    -
     y_test : array-like
         True test labels/values
     best_y_pred : array-like
