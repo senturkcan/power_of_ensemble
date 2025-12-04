@@ -516,8 +516,6 @@ print(f"Stacking Accuracy: {stacking_score:.4f}")
 
 
 
-
-
 print("\n" + "=" * 60)
 print("Training all the best models.")
 print("=" * 60)
@@ -887,7 +885,7 @@ class ModelEvaluator:
         if n_metrics == 1:
             axes = [axes]
         
-        colors = ['#1f77b4', '#ff7f0e', '#2ca02c']
+        colors = ["#1f7abb", "#ff660e", "#3cb53c"]
         
         for idx, metric in enumerate(metrics_to_compare):
             values = [r['metrics'][metric] for r in all_results]
